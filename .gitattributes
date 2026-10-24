@@ -1,0 +1,7 @@
+# Normalize line endings: stored as LF in the repo, converted to the
+# local platform's convention on checkout. Prevents Windows/Linux diff noise.
+* text=auto
+
+# Never modify these files' bytes
+*.db   binary
+*.zip  binary

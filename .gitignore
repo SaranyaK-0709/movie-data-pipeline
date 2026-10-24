@@ -1,0 +1,29 @@
+# ---- Secrets (NEVER commit) ----
+.env
+
+# ---- Virtual environment (recreate with: pip install -r requirements.txt) ----
+.venv/
+venv/
+
+# ---- Python cache / test artifacts ----
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# ---- Generated outputs (reproducible by running etl.py) ----
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+logs/
+*.log
+
+# ---- MovieLens dataset (download per README; not redistributed) ----
+data/*
+!data/README.md
+
+# ---- Editor / OS files ----
+.vscode/
+Thumbs.db
+desktop.ini
+.DS_Store
