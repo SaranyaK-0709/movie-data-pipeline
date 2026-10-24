@@ -223,7 +223,7 @@ def test_api_key_never_appears_in_config_repr(monkeypatch):
 def test_main_returns_error_code_when_file_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("OMDB_API_KEY", "abcd1234")
     write_files(tmp_path, movies=None)
-    code = etl.main(["--data-dir", str(tmp_path), "--log-dir", str(tmp_path / "logs")])
+    code = etl.main(["--data-dir", str(tmp_path), "--log-dir", str(tmp_path / "logs"), "--db", str(tmp_path / "test.db"), "--skip-api"])
     assert code == 1
 
 
@@ -231,7 +231,7 @@ def test_main_succeeds_and_writes_utf8_log(tmp_path, monkeypatch):
     monkeypatch.setenv("OMDB_API_KEY", "abcd1234")
     write_files(tmp_path)
     log_dir = tmp_path / "logs"
-    assert etl.main(["--data-dir", str(tmp_path), "--log-dir", str(log_dir)]) == 0
+    assert etl.main(["--data-dir", str(tmp_path), "--log-dir", str(log_dir), "--db", str(tmp_path / "test.db"), "--skip-api"]) == 0
 
     log_text = (log_dir / "pipeline.log").read_text(encoding="utf-8")
     assert "Extracted 3 movies" in log_text

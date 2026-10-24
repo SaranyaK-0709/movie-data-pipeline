@@ -3,7 +3,7 @@ etl.py - Movie Data Pipeline (MovieLens + OMDb -> SQLite)
 
 Pipeline stages
     1. Extract   read and validate movies.csv, ratings.csv, links.csv
-    2. Enrich    fetch movie details from the OMDb API (cached, resumable)   [Sub-step 4.2]
+    2. Enrich    fetch movie details from the OMDb API (cached, resumable)
     3. Transform clean, type and reshape the data                            [Sub-step 4.3]
     4. Load      upsert into SQLite inside one transaction (idempotent)      [Sub-step 4.4]
 
@@ -19,13 +19,21 @@ environment and is never logged.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import re
+import sqlite3
 import sys
+import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -39,6 +47,15 @@ DEFAULT_LOG_DIR = PROJECT_ROOT / "logs"
 SCHEMA_PATH = PROJECT_ROOT / "schema.sql"
 
 DEFAULT_MAX_API_CALLS = 950
+
+# OMDb API settings
+OMDB_URL = "https://www.omdbapi.com/"
+OMDB_TIMEOUT_SECONDS = 10
+OMDB_MAX_ATTEMPTS = 3          # tries per request for temporary failures (timeouts, 5xx)
+OMDB_BACKOFF_SECONDS = 1.0     # wait 1s, then 2s, ... between those tries
+OMDB_DELAY_SECONDS = 0.1       # pause between movies, to be polite to the free service
+MAX_ERROR_RUNS = 3             # a movie whose lookup keeps failing is retried on at most 3 runs
+YEAR_TOLERANCE = 1             # title fallback accepts OMDb year within +/- 1 of MovieLens year
 
 # Columns each input file must contain. Extra columns are allowed and ignored.
 REQUIRED_COLUMNS: dict[str, list[str]] = {
@@ -327,18 +344,370 @@ def extract_csv_sources(data_dir: Path) -> ExtractedData:
 
 
 # ---------------------------------------------------------------------------
+# Database connection
+# ---------------------------------------------------------------------------
+
+def connect_db(db_path: Path) -> sqlite3.Connection:
+    """Open the SQLite database, enforce foreign keys and apply schema.sql."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA foreign_keys = ON")  # SQLite does NOT enforce FKs without this
+    conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))  # IF NOT EXISTS: safe to repeat
+    return conn
+
+
+def utc_now() -> str:
+    """Current UTC time as 'YYYY-MM-DD HH:MM:SS'."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
+# Enrich: OMDb API client
+# ---------------------------------------------------------------------------
+
+class OmdbFatalError(Exception):
+    """A problem that makes every further request pointless (bad key, quota used up)."""
+
+
+class OmdbAuthError(OmdbFatalError):
+    """OMDb rejected the API key."""
+
+
+class OmdbRateLimitError(OmdbFatalError):
+    """OMDb reports the request limit has been reached."""
+
+
+class ApiBudgetExhausted(Exception):
+    """This run has used all the requests it is allowed (max_api_calls)."""
+
+
+@dataclass
+class OmdbResult:
+    """Outcome of one logical OMDb lookup (which may have needed several HTTP tries)."""
+
+    status: str                         # 'found' | 'not_found' | 'error'
+    http_status: int | None = None
+    data: dict[str, Any] | None = None  # parsed JSON body, if any
+    error: str | None = None
+
+
+class OmdbClient:
+    """
+    Small OMDb client with timeouts, retries, quota counting and error classification.
+
+    Important OMDb behaviour (observed in testing):
+      * "not found" comes back as HTTP 200 with {"Response": "False", "Error": "..."},
+        so success is decided by the JSON body, not the status code;
+      * an invalid key comes back as HTTP 401 {"Error": "Invalid API key!"}.
+    """
+
+    def __init__(self, api_key: str, max_calls: int, session: Any = None,
+                 sleep: Callable[[float], None] = time.sleep,
+                 timeout: float = OMDB_TIMEOUT_SECONDS, max_attempts: int = OMDB_MAX_ATTEMPTS,
+                 backoff: float = OMDB_BACKOFF_SECONDS) -> None:
+        self._api_key = api_key
+        self.max_calls = max_calls
+        self.calls_made = 0             # every HTTP request counts against the daily quota
+        self._session = session or requests.Session()
+        self._sleep = sleep
+        self._timeout = timeout
+        self._max_attempts = max_attempts
+        self._backoff = backoff
+
+    def _redact(self, text: str) -> str:
+        """Remove the API key from text (requests' error messages include the full URL)."""
+        return text.replace(self._api_key, "***") if self._api_key else text
+
+    def fetch(self, params: dict[str, str]) -> OmdbResult:
+        """Run one lookup, retrying temporary failures. Raises on fatal/budget conditions."""
+        last_error = "unknown error"
+        last_status: int | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            if self.calls_made >= self.max_calls:
+                raise ApiBudgetExhausted(f"used all {self.max_calls} API calls for this run")
+            self.calls_made += 1
+            try:
+                response = self._session.get(OMDB_URL, params={**params, "apikey": self._api_key},
+                                             timeout=self._timeout)
+            except requests.Timeout:
+                last_error = f"timeout after {self._timeout}s"
+            except requests.RequestException as exc:  # connection refused, DNS failure, ...
+                last_error = self._redact(f"{type(exc).__name__}: {exc}")
+            else:
+                last_status = response.status_code
+                result = self._classify(response)
+                if result is not None:
+                    return result
+                last_error = f"HTTP {response.status_code} or unreadable response"
+
+            if attempt < self._max_attempts:
+                wait = self._backoff * (2 ** (attempt - 1))
+                logger.debug("OMDb attempt %d failed (%s); retrying in %.1fs", attempt, last_error, wait)
+                self._sleep(wait)
+        return OmdbResult("error", http_status=last_status, error=last_error)
+
+    def _classify(self, response: Any) -> OmdbResult | None:
+        """Turn an HTTP response into a result; None means 'temporary, retry'."""
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        error_text = body.get("Error", "") if isinstance(body, dict) else ""
+
+        # Fatal conditions are recognised by the error text first, then by status code.
+        if "invalid api key" in error_text.lower() or "no api key" in error_text.lower():
+            raise OmdbAuthError(f"OMDb rejected the API key ({error_text})")
+        if "limit" in error_text.lower() or response.status_code == 429:
+            raise OmdbRateLimitError(f"OMDb request limit reached ({error_text or 'HTTP 429'})")
+        if response.status_code == 401:
+            raise OmdbAuthError(f"OMDb returned HTTP 401 ({error_text or 'no message'})")
+
+        if response.status_code >= 500:
+            return None                                   # server problem: retry
+        if not isinstance(body, dict):
+            return None                                   # malformed/empty body: retry
+        if body.get("Response") == "True":
+            return OmdbResult("found", response.status_code, body)
+        if body.get("Response") == "False":
+            if "not found" in error_text.lower() or "incorrect imdb id" in error_text.lower():
+                return OmdbResult("not_found", response.status_code, body, error_text)
+            return OmdbResult("error", response.status_code, body, error_text or "unknown OMDb error")
+        return OmdbResult("error", response.status_code, body, "response has no 'Response' field")
+
+
+# ---------------------------------------------------------------------------
+# Enrich: matching a MovieLens movie to OMDb
+# ---------------------------------------------------------------------------
+
+TITLE_YEAR = re.compile(r"\((\d{4})[^)]*\)\s*$")       # "(1995)" or "(2006-2007)" at the end
+TRAILING_PARENS = re.compile(r"\s*\([^()]*\)\s*$")
+MOVED_ARTICLE = re.compile(r"^(?P<rest>.+), (?P<article>The|A|An|Les|La|Le|L'|Il|El|Das|Der|Die)$")
+
+
+def year_from_title(title: str) -> int | None:
+    """'Toy Story (1995)' -> 1995; a range like '(2006-2007)' -> 2006; 'Black Mirror' -> None."""
+    match = TITLE_YEAR.search(title)
+    return int(match.group(1)) if match else None
+
+
+def parse_omdb_year(value: Any) -> int | None:
+    """OMDb 'Year' such as '1995', '2006-2007' or 'N/A' -> the first 4-digit year, or None."""
+    match = re.match(r"\s*(\d{4})", str(value or ""))
+    return int(match.group(1)) if match else None
+
+
+def search_title(title: str) -> str:
+    """
+    Turn a MovieLens title into the form OMDb expects for a title search.
+
+    'American President, The (1995)'                     -> 'The American President'
+    'Seven (a.k.a. Se7en) (1995)'                        -> 'Seven'
+    'Postman, The (Postino, Il) (1994)'                  -> 'The Postman'
+    """
+    text = title.strip()
+    while TRAILING_PARENS.search(text):                 # drop year and alternate titles
+        text = TRAILING_PARENS.sub("", text)
+    match = MOVED_ARTICLE.match(text)
+    if match:
+        article = match.group("article")
+        sep = "" if article.endswith("'") else " "
+        text = f"{article}{sep}{match.group('rest')}"
+    return text.strip()
+
+
+@dataclass
+class CacheEntry:
+    """What gets written to omdb_cache for one movie."""
+
+    movie_id: int
+    imdb_id: str | None
+    status: str
+    lookup_method: str
+    http_status: int | None = None
+    response_json: str | None = None
+    error_message: str | None = None
+
+
+def lookup_movie(client: OmdbClient, movie_id: int, title: str,
+                 imdb_id: str | None) -> CacheEntry:
+    """
+    Find one movie in OMDb.
+
+    1. By IMDb ID (exact; preferred).
+    2. Only if that is impossible or not found: by cleaned title + year, accepting
+       the result only when OMDb's year is within YEAR_TOLERANCE of the MovieLens year.
+       Without a year, no title search is made: it could attach the wrong film.
+    """
+    def entry(result: OmdbResult, method: str, error: str | None = None) -> CacheEntry:
+        body = json.dumps(result.data, ensure_ascii=False) if result.data is not None else None
+        return CacheEntry(movie_id, imdb_id, result.status, method, result.http_status,
+                          body, error or result.error)
+
+    first: OmdbResult | None = None
+    if imdb_id:
+        # No 'type' filter: the ID is exact, and some MovieLens entries are TV series.
+        first = client.fetch({"i": imdb_id})
+        if first.status in ("found", "error"):
+            return entry(first, "imdb_id")
+
+    year = year_from_title(title)
+    if year is None:
+        reason = "not found by IMDb ID" if imdb_id else "no IMDb ID"
+        result = first or OmdbResult("not_found")
+        return entry(result, "imdb_id" if imdb_id else "none",
+                     f"{reason}; no release year, so no title search (risk of a wrong match)")
+
+    result = client.fetch({"t": search_title(title), "y": str(year), "type": "movie"})
+    if result.status != "found":
+        return entry(result, "title_year")
+
+    omdb_year = parse_omdb_year(result.data.get("Year") if result.data else None)
+    if omdb_year is None or abs(omdb_year - year) > YEAR_TOLERANCE:
+        return entry(OmdbResult("not_found", result.http_status, result.data), "title_year",
+                     f"title match rejected: OMDb year {omdb_year} vs MovieLens year {year}")
+    return entry(result, "title_year")
+
+
+# ---------------------------------------------------------------------------
+# Enrich: cache + resumable stage
+# ---------------------------------------------------------------------------
+
+def save_cache_entry(conn: sqlite3.Connection, e: CacheEntry) -> None:
+    """Insert or update one movie's cache row and commit immediately (crash-safe progress)."""
+    conn.execute(
+        """
+        INSERT INTO omdb_cache (movie_id, imdb_id, status, lookup_method, http_status,
+                                response_json, error_message, attempts, fetched_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+        ON CONFLICT (movie_id) DO UPDATE SET
+            imdb_id = excluded.imdb_id, status = excluded.status,
+            lookup_method = excluded.lookup_method, http_status = excluded.http_status,
+            response_json = excluded.response_json, error_message = excluded.error_message,
+            attempts = omdb_cache.attempts + 1, fetched_at = excluded.fetched_at
+        """,
+        (e.movie_id, e.imdb_id, e.status, e.lookup_method, e.http_status,
+         e.response_json, e.error_message, utc_now()),
+    )
+    conn.commit()
+
+
+def movies_needing_lookup(conn: sqlite3.Connection, data: ExtractedData) -> pd.DataFrame:
+    """
+    Movies with no final cache result, most-rated first.
+
+    'found' and 'not_found' are final. 'error' is retried on later runs, up to
+    MAX_ERROR_RUNS attempts in total, so one broken record cannot use the quota forever.
+    """
+    cached = pd.read_sql_query("SELECT movie_id, status, attempts FROM omdb_cache", conn)
+    done = cached.loc[(cached["status"] != "error") | (cached["attempts"] >= MAX_ERROR_RUNS),
+                      "movie_id"]
+    rating_counts = data.ratings.groupby("movieId").size().rename("n_ratings")
+    todo = (data.movies.merge(data.links, on="movieId", how="left")
+            .merge(rating_counts, left_on="movieId", right_index=True, how="left")
+            .fillna({"n_ratings": 0}))
+    todo = todo[~todo["movieId"].isin(set(done))]
+    return todo.sort_values(["n_ratings", "movieId"], ascending=[False, True])
+
+
+@dataclass
+class EnrichStats:
+    attempted: int = 0
+    found: int = 0
+    not_found: int = 0
+    errors: int = 0
+    api_calls: int = 0
+    remaining: int = 0
+    stopped_reason: str = "completed"
+
+
+def enrich_with_omdb(conn: sqlite3.Connection, data: ExtractedData, config: Config,
+                     session: Any = None, sleep: Callable[[float], None] = time.sleep) -> EnrichStats:
+    """Look up every movie that has no final cached result, within this run's API budget."""
+    stats = EnrichStats()
+    todo = movies_needing_lookup(conn, data)
+    stats.remaining = len(todo)
+
+    if config.skip_api:
+        stats.stopped_reason = "skipped (--skip-api)"
+    elif not config.omdb_api_key:
+        stats.stopped_reason = "skipped (no OMDB_API_KEY configured)"
+        logger.warning("No OMDb API key configured; enrichment skipped, cached data will be used")
+    elif config.max_api_calls == 0:
+        stats.stopped_reason = "skipped (max_api_calls = 0)"
+    elif todo.empty:
+        stats.stopped_reason = "nothing to do (all movies already cached)"
+    else:
+        logger.info("Enrich: %d movie(s) need an OMDb lookup; budget %d API call(s)",
+                    len(todo), config.max_api_calls)
+        client = OmdbClient(config.omdb_api_key, config.max_api_calls, session=session, sleep=sleep)
+        try:
+            for i, row in enumerate(todo.itertuples(index=False), start=1):
+                imdb_id = row.imdb_id if isinstance(row.imdb_id, str) else None
+                e = lookup_movie(client, int(row.movieId), row.title, imdb_id)
+                save_cache_entry(conn, e)
+                stats.attempted += 1
+                stats.remaining -= 1
+                if e.status == "found":
+                    stats.found += 1
+                elif e.status == "not_found":
+                    stats.not_found += 1
+                else:
+                    stats.errors += 1
+                    logger.warning("OMDb error for movieId %s (%s): %s",
+                                   row.movieId, row.title, e.error_message)
+                if i % 100 == 0:
+                    logger.info("Enrich progress: %d looked up, %d API calls used",
+                                i, client.calls_made)
+                sleep(OMDB_DELAY_SECONDS)
+        except ApiBudgetExhausted as exc:
+            stats.stopped_reason = f"API budget reached ({exc})"
+        except OmdbFatalError as exc:
+            stats.stopped_reason = f"stopped: {exc}"
+            logger.error("Enrichment stopped early: %s. Progress so far is saved.", exc)
+        except KeyboardInterrupt:
+            logger.warning("Enrichment interrupted by user. Progress so far is saved.")
+            raise
+        finally:
+            stats.api_calls = client.calls_made
+
+    logger.info("Enrich: %s | looked up %d (found %d, not found %d, errors %d) | "
+                "API calls %d | still to look up %d",
+                stats.stopped_reason, stats.attempted, stats.found, stats.not_found,
+                stats.errors, stats.api_calls, stats.remaining)
+    log_cache_summary(conn, len(data.movies))
+    return stats
+
+
+def log_cache_summary(conn: sqlite3.Connection, total_movies: int) -> None:
+    """Log overall enrichment coverage across all runs so far."""
+    counts = dict(conn.execute("SELECT status, COUNT(*) FROM omdb_cache GROUP BY status").fetchall())
+    found = counts.get("found", 0)
+    logger.info("OMDb cache: %d found, %d not found, %d error, %d never looked up | "
+                "coverage %.1f%% of %d movies",
+                found, counts.get("not_found", 0), counts.get("error", 0),
+                total_movies - sum(counts.values()), 100 * found / max(total_movies, 1),
+                total_movies)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
 def run_pipeline(config: Config) -> ExtractedData:
-    """Run the pipeline stages in order. (Enrich/Transform/Load are added in 4.2-4.4.)"""
+    """Run the pipeline stages in order. (Transform and Load are added in 4.3-4.4.)"""
     logger.info("Pipeline started | data=%s | db=%s | max_api_calls=%d | skip_api=%s",
                 config.data_dir, config.db_path, config.max_api_calls, config.skip_api)
     logger.info("OMDb API key configured: %s", "yes" if config.omdb_api_key else "NO")
 
     extracted = extract_csv_sources(config.data_dir)
 
-    logger.info("Extract stage complete. Enrich, Transform and Load are not implemented yet.")
+    conn = connect_db(config.db_path)
+    try:
+        enrich_with_omdb(conn, extracted, config)
+    finally:
+        conn.close()
+
+    logger.info("Extract and Enrich complete. Transform and Load are not implemented yet.")
     return extracted
 
 
@@ -358,6 +727,9 @@ def main(argv: list[str] | None = None) -> int:
     except (FileNotFoundError, DataValidationError) as exc:
         logger.error("Pipeline stopped: %s", exc)
         return 1
+    except KeyboardInterrupt:
+        logger.warning("Pipeline interrupted by user")
+        return 130
     except Exception:
         logger.exception("Pipeline failed with an unexpected error")
         return 1
