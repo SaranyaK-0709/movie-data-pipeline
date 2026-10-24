@@ -5,7 +5,7 @@ Pipeline stages
     1. Extract   read and validate movies.csv, ratings.csv, links.csv
     2. Enrich    fetch movie details from the OMDb API (cached, resumable)
     3. Transform clean, type and reshape the data
-    4. Load      upsert into SQLite inside one transaction (idempotent)      [Sub-step 4.4]
+    4. Load      upsert into SQLite inside one transaction (idempotent)
 
 Usage (from the project root, virtual environment active):
     python etl.py                      # run the pipeline with defaults
@@ -895,11 +895,185 @@ def log_transform_summary(t: TransformedData) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Load: idempotent writes into SQLite
+# ---------------------------------------------------------------------------
+
+MOVIE_COLUMNS = ["movie_id", "imdb_id", "title", "release_year", "release_year_source",
+                 "release_decade", "plot", "box_office_usd", "released_date",
+                 "runtime_minutes", "enrichment_status", "enriched_at"]
+TABLES = ["movies", "genres", "movie_genres", "directors", "movie_directors", "ratings"]
+
+
+class LoadError(Exception):
+    """The loaded data failed a post-load integrity check (the load is rolled back)."""
+
+
+def to_rows(df: pd.DataFrame, columns: list[str]) -> list[tuple]:
+    """DataFrame -> list of tuples for sqlite3, with every missing value (NaN/<NA>) as None."""
+    subset = df[columns].astype(object)
+    return list(subset.where(subset.notna(), None).itertuples(index=False, name=None))
+
+
+def table_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    return {t: conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0] for t in TABLES}
+
+
+def upsert_movies(conn: sqlite3.Connection, movies: pd.DataFrame) -> int:
+    """
+    Insert new movies and update changed ones. Returns rows inserted or updated.
+
+    The WHERE clause skips rows whose values are identical, so re-running the
+    pipeline on unchanged data writes nothing (IS NOT also compares NULLs safely).
+    """
+    cols = ", ".join(MOVIE_COLUMNS)
+    updates = ", ".join(f"{c} = excluded.{c}" for c in MOVIE_COLUMNS[1:])
+    current = ", ".join(f"movies.{c}" for c in MOVIE_COLUMNS[1:])
+    incoming = ", ".join(f"excluded.{c}" for c in MOVIE_COLUMNS[1:])
+    before = conn.total_changes
+    conn.executemany(
+        f"INSERT INTO movies ({cols}) VALUES ({', '.join('?' * len(MOVIE_COLUMNS))}) "
+        f"ON CONFLICT (movie_id) DO UPDATE SET {updates} "
+        f"WHERE ({current}) IS NOT ({incoming})",
+        to_rows(movies, MOVIE_COLUMNS),
+    )
+    return conn.total_changes - before
+
+
+def upsert_ratings(conn: sqlite3.Connection, ratings: pd.DataFrame) -> int:
+    """Insert new ratings and update changed ones (same user + movie). Returns rows written."""
+    before = conn.total_changes
+    conn.executemany(
+        "INSERT INTO ratings (user_id, movie_id, rating, rated_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT (user_id, movie_id) DO UPDATE SET "
+        "rating = excluded.rating, rated_at = excluded.rated_at "
+        "WHERE (ratings.rating, ratings.rated_at) IS NOT (excluded.rating, excluded.rated_at)",
+        to_rows(ratings, ["user_id", "movie_id", "rating", "rated_at"]),
+    )
+    return conn.total_changes - before
+
+
+def sync_named_links(conn: sqlite3.Connection, pairs: pd.DataFrame, movie_ids: list[int], *,
+                     name_table: str, id_col: str, name_col: str, link_table: str,
+                     pair_name_col: str) -> tuple[int, int]:
+    """
+    Make link rows (e.g. movie_genres) match the source exactly for the loaded movies.
+
+    1. Names (genres/directors) are inserted once; the database assigns their IDs,
+       so the same name keeps the same ID on every run.
+    2. Missing links are added; links the source no longer has are removed.
+    3. Names no longer linked to any movie are removed.
+    Returns (links added, links removed).
+    """
+    conn.executemany(
+        f"INSERT INTO {name_table} ({name_col}) VALUES (?) ON CONFLICT ({name_col}) DO NOTHING",
+        [(n,) for n in sorted(pairs[pair_name_col].unique())],
+    )
+    ids = dict(conn.execute(f"SELECT {name_col}, {id_col} FROM {name_table}").fetchall())
+
+    conn.execute("DROP TABLE IF EXISTS temp.new_links")
+    conn.execute("CREATE TEMP TABLE new_links (movie_id INTEGER, ref_id INTEGER)")
+    conn.executemany("INSERT INTO temp.new_links VALUES (?, ?)",
+                     [(int(m), ids[n]) for m, n in pairs[["movie_id", pair_name_col]]
+                      .itertuples(index=False, name=None)])
+    conn.execute("DROP TABLE IF EXISTS temp.loaded_movies")
+    conn.execute("CREATE TEMP TABLE loaded_movies (movie_id INTEGER PRIMARY KEY)")
+    conn.executemany("INSERT INTO temp.loaded_movies VALUES (?)", [(int(m),) for m in movie_ids])
+
+    before = conn.total_changes
+    conn.execute(f"INSERT INTO {link_table} (movie_id, {id_col}) "
+                 f"SELECT movie_id, ref_id FROM temp.new_links WHERE true "
+                 f"ON CONFLICT DO NOTHING")
+    added = conn.total_changes - before
+
+    before = conn.total_changes
+    conn.execute(f"DELETE FROM {link_table} "
+                 f"WHERE movie_id IN (SELECT movie_id FROM temp.loaded_movies) "
+                 f"AND (movie_id, {id_col}) NOT IN (SELECT movie_id, ref_id FROM temp.new_links)")
+    removed = conn.total_changes - before
+
+    conn.execute(f"DELETE FROM {name_table} "
+                 f"WHERE {id_col} NOT IN (SELECT {id_col} FROM {link_table})")
+    conn.execute("DROP TABLE temp.new_links")
+    conn.execute("DROP TABLE temp.loaded_movies")
+    return added, removed
+
+
+def verify_database(conn: sqlite3.Connection) -> None:
+    """Fail loudly if any foreign key is broken (checked before the load is committed)."""
+    violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise LoadError(f"{len(violations)} foreign key violation(s), e.g. {violations[:3]}")
+
+
+@dataclass
+class LoadStats:
+    counts_before: dict[str, int]
+    counts_after: dict[str, int]
+    movies_written: int
+    ratings_written: int
+    genre_links: tuple[int, int]      # (added, removed)
+    director_links: tuple[int, int]   # (added, removed)
+
+
+def load(conn: sqlite3.Connection, t: TransformedData) -> LoadStats:
+    """
+    Write all transformed data in ONE transaction: either everything is saved or,
+    on any error, nothing is (the database keeps its previous state).
+    """
+    counts_before = table_counts(conn)
+    movie_ids = t.movies["movie_id"].tolist()
+    try:
+        with conn:  # commits on success, rolls back on any exception
+            movies_written = upsert_movies(conn, t.movies)       # movies first: others refer to them
+            genre_links = sync_named_links(
+                conn, t.movie_genres, movie_ids, name_table="genres", id_col="genre_id",
+                name_col="genre_name", link_table="movie_genres", pair_name_col="genre_name")
+            director_links = sync_named_links(
+                conn, t.movie_directors, movie_ids, name_table="directors", id_col="director_id",
+                name_col="director_name", link_table="movie_directors",
+                pair_name_col="director_name")
+            ratings_written = upsert_ratings(conn, t.ratings)
+            verify_database(conn)
+    except (sqlite3.Error, LoadError) as exc:
+        logger.error("Load failed and was rolled back; the database is unchanged: %s", exc)
+        raise
+
+    stats = LoadStats(counts_before, table_counts(conn), movies_written, ratings_written,
+                      genre_links, director_links)
+    log_load_summary(stats)
+    return stats
+
+
+def log_load_summary(s: LoadStats) -> None:
+    logger.info("Load: movies written %d | ratings written %d | genre links +%d/-%d | "
+                "director links +%d/-%d", s.movies_written, s.ratings_written,
+                *s.genre_links, *s.director_links)
+    for table in TABLES:
+        before, after = s.counts_before[table], s.counts_after[table]
+        logger.info("Load: %-16s %7d rows (before %d, change %+d)", table, after, before,
+                    after - before)
+    if s.movies_written == s.ratings_written == 0 and s.genre_links == s.director_links == (0, 0):
+        logger.info("Load: no changes - the database already matched the source (idempotent re-run)")
+
+
+def check_integrity(conn: sqlite3.Connection) -> None:
+    """Run SQLite's full integrity check after the load and log the result."""
+    result = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    fk_violations = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+    logger.info("Database checks: integrity_check=%s | foreign key violations=%d",
+                result, fk_violations)
+    if result != "ok" or fk_violations:
+        raise LoadError(f"database check failed: integrity_check={result}, "
+                        f"foreign key violations={fk_violations}")
+
+
+# ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
-def run_pipeline(config: Config) -> TransformedData:
-    """Run the pipeline stages in order. (Load is added in Sub-step 4.4.)"""
+def run_pipeline(config: Config) -> LoadStats:
+    """Run Extract -> Enrich -> Transform -> Load, then verify the database."""
+    started = time.perf_counter()
     logger.info("Pipeline started | data=%s | db=%s | max_api_calls=%d | skip_api=%s",
                 config.data_dir, config.db_path, config.max_api_calls, config.skip_api)
     logger.info("OMDb API key configured: %s", "yes" if config.omdb_api_key else "NO")
@@ -910,11 +1084,13 @@ def run_pipeline(config: Config) -> TransformedData:
     try:
         enrich_with_omdb(conn, extracted, config)
         transformed = transform(extracted, read_cache(conn))
+        stats = load(conn, transformed)
+        check_integrity(conn)
     finally:
         conn.close()
 
-    logger.info("Extract, Enrich and Transform complete. Load is not implemented yet.")
-    return transformed
+    logger.info("Pipeline finished successfully in %.1fs", time.perf_counter() - started)
+    return stats
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -930,7 +1106,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("Logging to %s", log_file)
     try:
         run_pipeline(config)
-    except (FileNotFoundError, DataValidationError) as exc:
+    except (FileNotFoundError, DataValidationError, LoadError) as exc:
         logger.error("Pipeline stopped: %s", exc)
         return 1
     except KeyboardInterrupt:
