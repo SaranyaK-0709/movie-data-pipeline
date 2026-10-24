@@ -348,3 +348,9 @@ def test_real_network_is_blocked_during_tests():
     """conftest.py must stop any test from reaching the real OMDb API."""
     with pytest.raises(RuntimeError, match="disabled"):
         requests.get(etl.OMDB_URL, params={"i": "tt0114709"}, timeout=1)
+
+
+def test_retries_are_counted_and_reported(conn, tmp_path):
+    """A temporary failure followed by success is visible in the stats (and the log)."""
+    stats, _ = run_enrich(conn, make_data(1), make_config(tmp_path), [requests.Timeout(), found()])
+    assert stats.found == 1 and stats.api_calls == 2 and stats.retries == 1

@@ -4,7 +4,7 @@ etl.py - Movie Data Pipeline (MovieLens + OMDb -> SQLite)
 Pipeline stages
     1. Extract   read and validate movies.csv, ratings.csv, links.csv
     2. Enrich    fetch movie details from the OMDb API (cached, resumable)
-    3. Transform clean, type and reshape the data                            [Sub-step 4.3]
+    3. Transform clean, type and reshape the data
     4. Load      upsert into SQLite inside one transaction (idempotent)      [Sub-step 4.4]
 
 Usage (from the project root, virtual environment active):
@@ -408,6 +408,7 @@ class OmdbClient:
         self._api_key = api_key
         self.max_calls = max_calls
         self.calls_made = 0             # every HTTP request counts against the daily quota
+        self.retries = 0                # requests repeated after a temporary failure
         self._session = session or requests.Session()
         self._sleep = sleep
         self._timeout = timeout
@@ -442,7 +443,9 @@ class OmdbClient:
 
             if attempt < self._max_attempts:
                 wait = self._backoff * (2 ** (attempt - 1))
-                logger.debug("OMDb attempt %d failed (%s); retrying in %.1fs", attempt, last_error, wait)
+                self.retries += 1
+                logger.warning("OMDb request failed (%s); retry %d/%d in %.1fs",
+                               last_error, attempt, self._max_attempts - 1, wait)
                 self._sleep(wait)
         return OmdbResult("error", http_status=last_status, error=last_error)
 
@@ -616,6 +619,7 @@ class EnrichStats:
     not_found: int = 0
     errors: int = 0
     api_calls: int = 0
+    retries: int = 0
     remaining: int = 0
     stopped_reason: str = "completed"
 
@@ -669,11 +673,12 @@ def enrich_with_omdb(conn: sqlite3.Connection, data: ExtractedData, config: Conf
             raise
         finally:
             stats.api_calls = client.calls_made
+            stats.retries = client.retries
 
     logger.info("Enrich: %s | looked up %d (found %d, not found %d, errors %d) | "
-                "API calls %d | still to look up %d",
+                "API calls %d (retries %d) | still to look up %d",
                 stats.stopped_reason, stats.attempted, stats.found, stats.not_found,
-                stats.errors, stats.api_calls, stats.remaining)
+                stats.errors, stats.api_calls, stats.retries, stats.remaining)
     log_cache_summary(conn, len(data.movies))
     return stats
 
@@ -690,11 +695,211 @@ def log_cache_summary(conn: sqlite3.Connection, total_movies: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Transform: value parsers (each turns one raw value into a clean typed value)
+# ---------------------------------------------------------------------------
+
+NO_GENRES = "(no genres listed)"
+MONTHS = {m: i for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], start=1)}
+MIN_YEAR, MAX_YEAR = 1870, 2100
+
+
+def clean_text(value: Any) -> str | None:
+    """Strip text; OMDb's 'N/A', empty strings and missing values become None."""
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return None
+    text = str(value).strip()
+    return None if text in ("", "N/A") else text
+
+
+def parse_box_office(value: Any) -> int | None:
+    """'$292,587,330' -> 292587330; 'N/A' or anything unparseable -> None."""
+    text = clean_text(value)
+    if text is None:
+        return None
+    digits = text.replace("$", "").replace(",", "").strip()
+    return int(digits) if digits.isdigit() else None
+
+
+def parse_released_date(value: Any) -> str | None:
+    """'16 Jul 2010' -> '2010-07-16' (ISO); 'N/A' or invalid dates -> None."""
+    text = clean_text(value)
+    match = re.fullmatch(r"(\d{1,2}) ([A-Z][a-z]{2}) (\d{4})", text or "")
+    if not match or match.group(2) not in MONTHS:
+        return None
+    day, month, year = int(match.group(1)), MONTHS[match.group(2)], int(match.group(3))
+    try:  # rejects impossible dates such as 31 Feb
+        return datetime(year, month, day).strftime("%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def parse_runtime(value: Any) -> int | None:
+    """'148 min' -> 148; 'N/A', '0 min' or other formats -> None."""
+    match = re.fullmatch(r"(\d+)\s*min", clean_text(value) or "")
+    minutes = int(match.group(1)) if match else 0
+    return minutes if minutes > 0 else None
+
+
+def split_directors(value: Any) -> list[str]:
+    """
+    'Lana Wachowski, Lilly Wachowski' -> ['Lana Wachowski', 'Lilly Wachowski'].
+    Notes such as '(uncredited)' are removed; duplicates and 'N/A' are dropped.
+    """
+    names: list[str] = []
+    for part in (clean_text(value) or "").split(","):
+        name = re.sub(r"\s*\([^)]*\)\s*$", "", part).strip()
+        if name and name != "N/A" and name not in names:
+            names.append(name)
+    return names
+
+
+def split_genres(value: Any) -> list[str]:
+    """'Adventure|Animation' -> ['Adventure', 'Animation']; '(no genres listed)' -> []."""
+    genres: list[str] = []
+    for part in (clean_text(value) or "").split("|"):
+        genre = part.strip()
+        if genre and genre != NO_GENRES and genre not in genres:
+            genres.append(genre)
+    return genres
+
+
+def valid_year(year: int | None) -> int | None:
+    """Keep only plausible release years (matches the CHECK in schema.sql)."""
+    return year if year is not None and MIN_YEAR <= year <= MAX_YEAR else None
+
+
+def decade_of(year: int | None) -> int | None:
+    """Feature engineering: 1995 -> 1990."""
+    return None if year is None else (year // 10) * 10
+
+
+def unix_to_utc_text(seconds: pd.Series) -> pd.Series:
+    """Unix epoch seconds -> 'YYYY-MM-DD HH:MM:SS' in UTC."""
+    return pd.to_datetime(seconds, unit="s", utc=True).dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
+# ---------------------------------------------------------------------------
+# Transform: build the rows for each table
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TransformedData:
+    """Clean rows ready for loading. Genre/director IDs are assigned by the database."""
+
+    movies: pd.DataFrame        # one row per movie, columns match the movies table
+    movie_genres: pd.DataFrame  # movie_id, genre_name
+    movie_directors: pd.DataFrame  # movie_id, director_name
+    ratings: pd.DataFrame       # user_id, movie_id, rating, rated_at
+
+
+def read_cache(conn: sqlite3.Connection) -> pd.DataFrame:
+    """All cached OMDb results: movie_id, status, response_json, fetched_at."""
+    return pd.read_sql_query(
+        "SELECT movie_id, status, response_json, fetched_at FROM omdb_cache", conn)
+
+
+def _parse_json(text: Any, movie_id: int) -> dict[str, Any]:
+    """Parse a cached response body; a corrupt body is logged and treated as empty."""
+    if not isinstance(text, str):
+        return {}
+    try:
+        body = json.loads(text)
+    except ValueError:
+        logger.warning("Cached OMDb response for movieId %s is not valid JSON; ignored", movie_id)
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+STATUS_FROM_CACHE = {"found": "enriched", "not_found": "not_found", "error": "error"}
+
+
+def transform(data: ExtractedData, cache: pd.DataFrame) -> TransformedData:
+    """Combine MovieLens data with cached OMDb details into clean, typed table rows."""
+    cache_by_movie = {int(r.movie_id): r for r in cache.itertuples(index=False)}
+    imdb_by_movie = dict(zip(data.links["movieId"], data.links["imdb_id"]))
+
+    movie_rows: list[dict[str, Any]] = []
+    genre_pairs: list[tuple[int, str]] = []
+    director_pairs: list[tuple[int, str]] = []
+
+    for movie in data.movies.itertuples(index=False):
+        movie_id = int(movie.movieId)
+        cached = cache_by_movie.get(movie_id)
+        status = STATUS_FROM_CACHE.get(cached.status, "pending") if cached else "pending"
+        omdb = _parse_json(cached.response_json, movie_id) if status == "enriched" else {}
+
+        # Release year: MovieLens title first (the original release); OMDb only as fallback.
+        year, source = valid_year(year_from_title(movie.title)), "movielens"
+        if year is None:
+            year, source = valid_year(parse_omdb_year(omdb.get("Year"))), "omdb"
+        if year is None:
+            source = None
+
+        imdb_id = imdb_by_movie.get(movie_id)
+        movie_rows.append({
+            "movie_id": movie_id,
+            "imdb_id": imdb_id if isinstance(imdb_id, str) else None,
+            "title": movie.title,
+            "release_year": year,
+            "release_year_source": source,
+            "release_decade": decade_of(year),
+            "plot": clean_text(omdb.get("Plot")),
+            "box_office_usd": parse_box_office(omdb.get("BoxOffice")),
+            "released_date": parse_released_date(omdb.get("Released")),
+            "runtime_minutes": parse_runtime(omdb.get("Runtime")),
+            "enrichment_status": status,
+            "enriched_at": cached.fetched_at if status == "enriched" else None,
+        })
+        genre_pairs += [(movie_id, g) for g in split_genres(movie.genres)]
+        director_pairs += [(movie_id, d) for d in split_directors(omdb.get("Director"))]
+
+    # Nullable integer columns keep missing values as <NA> instead of turning ints into floats.
+    movies = pd.DataFrame(movie_rows).astype({
+        "release_year": "Int64", "release_decade": "Int64",
+        "box_office_usd": "Int64", "runtime_minutes": "Int64",
+    })
+    ratings = pd.DataFrame({
+        "user_id": data.ratings["userId"],
+        "movie_id": data.ratings["movieId"],
+        "rating": data.ratings["rating"].astype("float64"),
+        "rated_at": unix_to_utc_text(data.ratings["timestamp"]),
+    })
+    result = TransformedData(
+        movies=movies,
+        movie_genres=pd.DataFrame(genre_pairs, columns=["movie_id", "genre_name"]),
+        movie_directors=pd.DataFrame(director_pairs, columns=["movie_id", "director_name"]),
+        ratings=ratings,
+    )
+    log_transform_summary(result)
+    return result
+
+
+def log_transform_summary(t: TransformedData) -> None:
+    """Log what the Transform stage produced, so each run can be checked from the log."""
+    m = t.movies
+    by_source = m["release_year_source"].value_counts().to_dict()
+    logger.info("Transform: %d movies | release year from MovieLens %d, from OMDb %d, unknown %d",
+                len(m), by_source.get("movielens", 0), by_source.get("omdb", 0),
+                int(m["release_year"].isna().sum()))
+    logger.info("Transform: enrichment %s | with director %d | with box office %d | "
+                "with release date %d | with runtime %d",
+                m["enrichment_status"].value_counts().to_dict(),
+                t.movie_directors["movie_id"].nunique(), int(m["box_office_usd"].notna().sum()),
+                int(m["released_date"].notna().sum()), int(m["runtime_minutes"].notna().sum()))
+    logger.info("Transform: %d distinct genres, %d movie-genre links | %d distinct directors, "
+                "%d movie-director links | %d ratings",
+                t.movie_genres["genre_name"].nunique(), len(t.movie_genres),
+                t.movie_directors["director_name"].nunique(), len(t.movie_directors),
+                len(t.ratings))
+
+
+# ---------------------------------------------------------------------------
 # Pipeline entry point
 # ---------------------------------------------------------------------------
 
-def run_pipeline(config: Config) -> ExtractedData:
-    """Run the pipeline stages in order. (Transform and Load are added in 4.3-4.4.)"""
+def run_pipeline(config: Config) -> TransformedData:
+    """Run the pipeline stages in order. (Load is added in Sub-step 4.4.)"""
     logger.info("Pipeline started | data=%s | db=%s | max_api_calls=%d | skip_api=%s",
                 config.data_dir, config.db_path, config.max_api_calls, config.skip_api)
     logger.info("OMDb API key configured: %s", "yes" if config.omdb_api_key else "NO")
@@ -704,11 +909,12 @@ def run_pipeline(config: Config) -> ExtractedData:
     conn = connect_db(config.db_path)
     try:
         enrich_with_omdb(conn, extracted, config)
+        transformed = transform(extracted, read_cache(conn))
     finally:
         conn.close()
 
-    logger.info("Extract and Enrich complete. Transform and Load are not implemented yet.")
-    return extracted
+    logger.info("Extract, Enrich and Transform complete. Load is not implemented yet.")
+    return transformed
 
 
 def main(argv: list[str] | None = None) -> int:
