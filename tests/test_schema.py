@@ -94,6 +94,12 @@ def test_invalid_movies_rejected(conn, kwargs):
         insert_movie(conn, **kwargs)
 
 
+def test_movie_without_imdb_id_is_allowed(conn):
+    """A movie with no IMDb link must still load (it may be matched by title + year)."""
+    insert_movie(conn, movie_id=1, imdb_id=None)
+    insert_movie(conn, movie_id=2, imdb_id=None)  # several NULLs are allowed by UNIQUE
+
+
 def test_duplicate_movie_id_rejected(conn):
     insert_movie(conn)
     with pytest.raises(sqlite3.IntegrityError):
@@ -182,17 +188,26 @@ def test_co_directors_both_linked(conn):
 
 # ---------------------------------------------------------------- omdb_cache
 
-def test_cache_accepts_valid_row(conn):
+def insert_cache(conn, movie_id=1, imdb_id="tt0114709", status="found", method="imdb_id"):
     conn.execute(
-        "INSERT INTO omdb_cache (imdb_id, status, lookup_method, http_status, fetched_at) "
-        "VALUES ('tt0114709', 'found', 'imdb_id', 200, '2026-10-24 08:00:00')"
+        "INSERT INTO omdb_cache (movie_id, imdb_id, status, lookup_method, http_status, fetched_at) "
+        "VALUES (?, ?, ?, ?, 200, '2026-10-24 08:00:00')", (movie_id, imdb_id, status, method),
     )
+
+
+def test_cache_accepts_valid_rows(conn):
+    insert_cache(conn)
+    insert_cache(conn, movie_id=2, imdb_id=None, status="not_found", method="none")
+    assert conn.execute("SELECT attempts FROM omdb_cache WHERE movie_id = 1").fetchone()[0] == 1
+
+
+def test_cache_has_one_row_per_movie(conn):
+    insert_cache(conn)
+    with pytest.raises(sqlite3.IntegrityError):
+        insert_cache(conn)
 
 
 @pytest.mark.parametrize("status, method", [("ok", "imdb_id"), ("found", "guess")])
 def test_cache_rejects_invalid_values(conn, status, method):
     with pytest.raises(sqlite3.IntegrityError):
-        conn.execute(
-            "INSERT INTO omdb_cache (imdb_id, status, lookup_method, fetched_at) "
-            "VALUES ('tt0114709', ?, ?, '2026-10-24 08:00:00')", (status, method),
-        )
+        insert_cache(conn, status=status, method=method)

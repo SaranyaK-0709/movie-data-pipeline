@@ -1,5 +1,5 @@
 -- =====================================================================
--- schema.sql — Movie Data Pipeline (SQLite)
+-- schema.sql - Movie Data Pipeline (SQLite)
 -- =====================================================================
 -- Design summary
 --   movies          one row per MovieLens movie, plus OMDb enrichment
@@ -29,7 +29,7 @@
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS movies (
     movie_id            INTEGER PRIMARY KEY,          -- MovieLens movieId
-    imdb_id             TEXT    NOT NULL UNIQUE,      -- e.g. 'tt0114709' (from links.csv)
+    imdb_id             TEXT    UNIQUE,               -- e.g. 'tt0114709' (links.csv); NULL if unknown
     title               TEXT    NOT NULL,             -- original MovieLens title, whitespace-trimmed
     release_year        INTEGER,                      -- NULL when unknown
     release_year_source TEXT,                         -- where release_year came from
@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS movies (
     enrichment_status   TEXT    NOT NULL DEFAULT 'pending',
     enriched_at         TEXT,                         -- when OMDb data was fetched (UTC)
 
-    CHECK (imdb_id GLOB 'tt[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*'),
+    -- NULL is allowed so a movie without an IMDb link is still loaded; SQLite's
+    -- UNIQUE permits many NULLs but no two equal IMDb IDs.
+    CHECK (imdb_id IS NULL OR imdb_id GLOB 'tt[0-9][0-9][0-9][0-9][0-9][0-9][0-9]*'),
     CHECK (length(trim(title)) > 0),
     CHECK (release_year IS NULL OR release_year BETWEEN 1870 AND 2100),
     CHECK (release_year_source IS NULL OR release_year_source IN ('movielens', 'omdb')),
@@ -118,13 +120,15 @@ CREATE INDEX IF NOT EXISTS idx_ratings_movie_id ON ratings (movie_id);
 
 
 -- ---------------------------------------------------------------------
--- omdb_cache: raw API results, one row per movie (keyed by IMDb ID).
+-- omdb_cache: raw API results, one row per MovieLens movie.
 -- This is an EXTRACT-stage table: it is filled before movies are loaded,
--- so it intentionally has no foreign key to movies.
+-- so it intentionally has no foreign key to movies. It is keyed by movie_id
+-- (always present) rather than imdb_id (missing for some movies in principle).
 -- Re-runs read from here instead of calling the API again.
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS omdb_cache (
-    imdb_id       TEXT    PRIMARY KEY,
+    movie_id      INTEGER PRIMARY KEY,                -- MovieLens movieId
+    imdb_id       TEXT,                               -- the IMDb ID that was looked up, if any
     status        TEXT    NOT NULL,                   -- outcome of the last attempt
     lookup_method TEXT    NOT NULL,                   -- how the match was made
     http_status   INTEGER,
@@ -134,6 +138,6 @@ CREATE TABLE IF NOT EXISTS omdb_cache (
     fetched_at    TEXT    NOT NULL,                   -- UTC
 
     CHECK (status IN ('found', 'not_found', 'error')),
-    CHECK (lookup_method IN ('imdb_id', 'title_year')),
+    CHECK (lookup_method IN ('imdb_id', 'title_year', 'none')),
     CHECK (attempts >= 1)
 ) STRICT;
