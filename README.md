@@ -55,7 +55,9 @@ What happens when you run `python etl.py`:
 ### Requirements
 
 - Python **3.11 or newer** (developed and tested with 3.12.4; pandas 3 needs 3.11+)
-- SQLite **3.37 or newer** (bundled with Python 3.11+; checked by a test)
+- SQLite **3.37 or newer** (included with the python.org installers for Windows and macOS; on Linux, Python
+  usually uses the system SQLite, so check with `python -c "import sqlite3; print(sqlite3.sqlite_version)"`;
+  a test also checks it)
 - A free OMDb API key: <https://www.omdbapi.com/apikey.aspx>
 
 ### Setup (Windows PowerShell)
@@ -268,7 +270,7 @@ After commit, `PRAGMA integrity_check` runs and row counts before/after are logg
 | Situation | Behaviour |
 |---|---|
 | `{"Response": "False", "Error": "Movie not found!"}` with **HTTP 200** | `not_found`; success is judged by the JSON body, not the status code |
-| Timeout, connection error, HTTP 5xx, malformed JSON | Retried up to 3 times (backoff 1 s, 2 s), then `error` |
+| Timeout, connection error, HTTP 5xx, malformed JSON | Tried up to 3 times in total (1 original attempt + 2 retries, waiting 1 s then 2 s), then `error` |
 | `error` on later runs | Retried, at most 3 runs in total |
 | Invalid key (HTTP 401) | Enrichment stops at once; cached progress is kept |
 | "Request limit reached!" or HTTP 429 | Enrichment stops; the next run resumes |
