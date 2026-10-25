@@ -37,7 +37,7 @@ cleans and models the data in SQLite, and answers four analytical questions in S
 | **Main script** | `etl.py`: Extract -> Enrich (OMDb) -> Transform -> Load, in one command |
 | **Questions** | `queries.sql`, run with `python scripts/run_queries.py` |
 | **Tests** | 196 automated tests (`pytest`); no test calls the real API |
-| **Key properties** | Idempotent (re-runs change nothing), resumable API enrichment, single-transaction load |
+| **Key properties** | Idempotent database loading: rerunning the pipeline with unchanged data does not create duplicates or unnecessary updates. Resumable API enrichment, single-transaction load |
 
 What happens when you run `python etl.py`:
 
@@ -295,7 +295,9 @@ Running the pipeline any number of times never creates duplicates. Four layers g
    `IS NOT` treats two NULLs as equal, unlike `!=`.
 4. **Link synchronisation:** missing links are added and links the source no longer has are removed.
 
-**Evidence from the real data** (second consecutive run of `python etl.py --skip-api`):
+**Evidence from the real data:** an earlier verification run on 24 Oct 2026 (the second of two
+consecutive `python etl.py --skip-api` runs, when 969 movies were enriched). The director counts
+below are from that run; the current database has more, because enrichment has continued since:
 
 ```text
 Load: movies written 0 | ratings written 0 | genre links +0/-0 | director links +0/-0
@@ -311,6 +313,10 @@ Database checks: integrity_check=ok | foreign key violations=0
 
 The test `test_whole_pipeline_run_twice_gives_identical_database` runs the full pipeline twice
 and compares every table row by row.
+
+The reverse also holds: when the input does change, only the changed rows are written. The
+day-2 run on 25 Oct 2026 looked up 950 more movies and wrote exactly those 950 movie rows and
+0 of the 100,836 ratings (`Load: movies written 950 | ratings written 0`).
 
 ---
 
