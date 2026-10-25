@@ -433,8 +433,11 @@ python -m pytest -v         # one line per test
   movies go first, they cover **77.3% of all ratings** (measured). Q3 (directors), box office and plots
   therefore cover the enriched subset only. Running `python etl.py` once a day continues
   automatically from the cache.
-- One movie currently has status `error` (OMDb returned "Error getting data." on 2
-  attempts so far); it is retried automatically, up to 3 attempts in total.
+- As of the 25 October 2026 run, one movie (Confessions of a Dangerous Mind, 2002) had status
+  `error`: OMDb returned "Error getting data." on both lookup runs so far. Error-status movies are
+  looked up again on later pipeline runs, up to 3 lookup runs per movie in total. This is separate
+  from the retries for temporary network or server failures, where each API request is tried up
+  to 3 times (1 original attempt + 2 retries).
 - Not-enriched movies keep `enrichment_status = 'pending'` and NULL OMDb fields.
 - Averages for small groups (early release years, small genres) are statistically weak.
 - The load inserts and updates; it does not delete movies or ratings that disappear from the source.
