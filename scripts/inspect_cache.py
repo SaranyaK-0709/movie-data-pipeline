@@ -33,6 +33,13 @@ def main() -> None:
             "SELECT lookup_method, COUNT(*) FROM omdb_cache GROUP BY lookup_method"):
         print(f"    {method:<10} {n:>6}")
 
+    n_enriched, n_ratings = conn.execute(
+        "SELECT COALESCE(SUM(m.enrichment_status = 'enriched'), 0), COUNT(*) "
+        "FROM ratings AS r JOIN movies AS m ON m.movie_id = r.movie_id").fetchone()
+    if n_ratings:
+        print(f"\nRatings on enriched movies: {n_enriched} of {n_ratings} "
+              f"({100 * n_enriched / n_ratings:.1f}%)")
+
     print(f"\nLatest {limit} cached movies:")
     rows = conn.execute(
         """
