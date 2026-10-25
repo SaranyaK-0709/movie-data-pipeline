@@ -135,8 +135,9 @@ flowchart LR
 ```
 
 The key design idea: **raw API responses are stored separately from the modelled tables.**
-`omdb_cache` makes enrichment resumable and auditable; the modelled tables are rebuilt from
-the CSV files plus the cache on every run, so every run produces the same result.
+`omdb_cache` makes enrichment resumable and auditable. The modelled tables are updated from
+the CSV files and cached API responses on each run. When the inputs remain unchanged,
+rerunning the pipeline produces the same database state.
 
 ---
 
