@@ -283,7 +283,7 @@ budget-limited run loses nothing; the next run skips every movie with a final re
 **Daily quota:** the free key allows 1,000 requests/day, and the dataset has 9,742 movies (at
 least 10 days for full coverage). Movies are therefore enriched **most-rated first**. Profiling
 showed the 950 most-rated movies (about 10% of movies) account for **59.4% of all ratings**.
-After two days (1,967 movies), the measured coverage is **77.3% of all ratings**
+After three days (2,916 movies), the measured coverage is **85.5% of all ratings**
 (`python scripts/inspect_cache.py` prints the current figure).
 
 ---
@@ -325,8 +325,8 @@ day-2 run on 25 Oct 2026 looked up 950 more movies and wrote exactly those 950 m
 
 ## 8. Results: the four questions
 
-From `python scripts/run_queries.py` on the database built on **25 Oct 2026**
-(1,967 of 9,742 movies enriched, covering 77.3% of all ratings; see [Limitations](#13-limitations)).
+From `python scripts/run_queries.py` on the database built on **26 Oct 2026**
+(2,916 of 9,742 movies enriched, covering 85.5% of all ratings; see [Limitations](#13-limitations)).
 Each query in [`queries.sql`](queries.sql) documents its interpretation in a comment.
 
 **Q1. Which movie has the highest average rating?**
@@ -357,8 +357,8 @@ two. All tied movies are returned (none is silently picked by `LIMIT 1`).
 The definition matters: weighting each movie equally (last column) would put Documentary first.
 Film-Noir leads on a relatively small sample (870 ratings).
 
-**Q3. Director with the most movies:** **Steven Spielberg, 21 movies**, counted over the
-1,967 enriched movies (it was 17 with 969 enriched and 20 with 1,918). Co-directed films count for each director. This answer covers the enriched
+**Q3. Director with the most movies:** **Steven Spielberg, 23 movies**, counted over the
+2,916 enriched movies (it was 17 with 969 enriched, 20 with 1,918 and 21 with 1,967). Co-directed films count for each director. This answer covers the enriched
 subset only and can change as enrichment continues.
 
 **Q4. Average rating of movies released each year:** 106 release years (1902-2018); run
@@ -428,14 +428,15 @@ python -m pytest -v         # one line per test
 
 ## 13. Limitations
 
-- **Partial enrichment.** As of 25 Oct 2026, after two days (the daily limit was reached on
-  day 2), 1,967 of 9,742 movies (20.2%) are enriched. Because the most-rated
-  movies go first, they cover **77.3% of all ratings** (measured). Q3 (directors), box office and plots
+- **Partial enrichment.** As of 26 Oct 2026, after three days of runs, 2,916 of 9,742
+  movies (29.9%) are enriched. Because the most-rated movies go first, they cover
+  **85.5% of all ratings** (measured). Q3 (directors), box office and plots
   therefore cover the enriched subset only. Running `python etl.py` once a day continues
   automatically from the cache.
-- As of the 25 October 2026 run, one movie (Confessions of a Dangerous Mind, 2002) had status
-  `error`: OMDb returned "Error getting data." on both lookup runs so far. Error-status movies are
-  looked up again on later pipeline runs, up to 3 lookup runs per movie in total. This is separate
+- As of the 26 October 2026 run, one movie (Confessions of a Dangerous Mind, 2002) has status
+  `error`: OMDb returned "Error getting data." on all 3 lookup runs (two on 25 Oct, one on 26 Oct), so the pipeline
+  no longer retries it. Error-status movies are looked up again on later pipeline runs, up to
+  3 lookup runs per movie in total. This is separate
   from the retries for temporary network or server failures, where each API request is tried up
   to 3 times (1 original attempt + 2 retries).
 - Not-enriched movies keep `enrichment_status = 'pending'` and NULL OMDb fields.
