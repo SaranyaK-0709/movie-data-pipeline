@@ -283,7 +283,7 @@ budget-limited run loses nothing; the next run skips every movie with a final re
 **Daily quota:** the free key allows 1,000 requests/day, and the dataset has 9,742 movies (at
 least 10 days for full coverage). Movies are therefore enriched **most-rated first**. Profiling
 showed the 950 most-rated movies (about 10% of movies) account for **59.4% of all ratings**.
-After seven days of runs (6,747 movies), the measured coverage is **97.0% of all ratings**
+After eight days of runs (7,694 movies), the measured coverage is **98.0% of all ratings**
 (`python scripts/inspect_cache.py` prints the current figure).
 
 ---
@@ -325,8 +325,8 @@ day-2 run on 25 Oct 2026 looked up 950 more movies and wrote exactly those 950 m
 
 ## 8. Results: the four questions
 
-From `python scripts/run_queries.py` on the database built on **4 Nov 2026**
-(6,747 of 9,742 movies enriched, covering 97.0% of all ratings; see [Limitations](#13-limitations)).
+From `python scripts/run_queries.py` on the database built on **6 Nov 2026**
+(7,694 of 9,742 movies enriched, covering 98.0% of all ratings; see [Limitations](#13-limitations)).
 Each query in [`queries.sql`](queries.sql) documents its interpretation in a comment.
 
 **Q1. Which movie has the highest average rating?**
@@ -357,8 +357,8 @@ two. All tied movies are returned (none is silently picked by `LIMIT 1`).
 The definition matters: weighting each movie equally (last column) would put Documentary first.
 Film-Noir leads on a relatively small sample (870 ratings).
 
-**Q3. Director with the most movies:** **Woody Allen, 38 movies**, counted over the
-6,747 enriched movies (27 with 3,863; 37 with 4,809 and 5,800). In earlier runs Steven Spielberg led (17 with 969 enriched,
+**Q3. Director with the most movies:** **Woody Allen, 41 movies**, counted over the
+7,694 enriched movies (27 with 3,863; 37 with 4,809 and 5,800; 38 with 6,747). In earlier runs Steven Spielberg led (17 with 969 enriched,
 20 with 1,918, 21 with 1,967 and 23 with 2,916); as less-rated films were enriched, Woody Allen
 overtook him.
 Co-directed films count for each director. This answer covers the enriched subset only and can
@@ -431,17 +431,17 @@ python -m pytest -v         # one line per test
 
 ## 13. Limitations
 
-- **Partial enrichment.** As of 4 Nov 2026, after seven days of runs, 6,747 of 9,742
-  movies (69.3%) are enriched. Because the most-rated movies go first, they cover
-  **97.0% of all ratings** (measured). Q3 (directors), box office and plots
+- **Partial enrichment.** As of 6 Nov 2026, after eight days of runs, 7,694 of 9,742
+  movies (79.0%) are enriched. Because the most-rated movies go first, they cover
+  **98.0% of all ratings** (measured). Q3 (directors), box office and plots
   therefore cover the enriched subset only. Running `python etl.py` once a day continues
   automatically from the cache.
-- As of the 4 November 2026 run, eight movies have status `error` ("Error getting data.").
-  Five returned it on all 3 lookup runs, so the pipeline no longer retries them: Confessions of a
-  Dangerous Mind (2002), Pokemon 3: The Movie (2001), Saturn 3 (1980), Clockstoppers (2002) and
-  Lagaan: Once Upon a Time in India (2001). Pokemon 4 Ever (2002, 2 of 3 lookup runs), Berlin
-  Calling (2008) and Horrors of Spider Island (1960) (1 of 3 each) will be looked up again on
-  later runs.
+- As of the 6 November 2026 run, eight movies have status `error` ("Error getting data.").
+  Six returned it on all 3 lookup runs, so the pipeline no longer retries them: Confessions of a
+  Dangerous Mind (2002), Pokemon 3: The Movie (2001), Saturn 3 (1980), Clockstoppers (2002),
+  Lagaan: Once Upon a Time in India (2001) and Pokemon 4 Ever (2002). Berlin Calling (2008) and
+  Horrors of Spider Island (1960) returned it on 4 and 6 Nov (2 of 3 lookup runs each) and will be
+  looked up once more.
   Error-status movies are looked up again on later pipeline runs, up to
   3 lookup runs per movie in total. This is separate
   from the retries for temporary network or server failures, where each API request is tried up
