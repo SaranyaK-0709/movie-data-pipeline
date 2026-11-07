@@ -283,7 +283,7 @@ budget-limited run loses nothing; the next run skips every movie with a final re
 **Daily quota:** the free key allows 1,000 requests/day, and the dataset has 9,742 movies (at
 least 10 days for full coverage). Movies are therefore enriched **most-rated first**. Profiling
 showed the 950 most-rated movies (about 10% of movies) account for **59.4% of all ratings**.
-After eight days of runs (7,694 movies), the measured coverage is **98.0% of all ratings**
+After nine days of runs (8,639 movies), the measured coverage is **98.9% of all ratings**
 (`python scripts/inspect_cache.py` prints the current figure).
 
 ---
@@ -325,8 +325,8 @@ day-2 run on 25 Oct 2026 looked up 950 more movies and wrote exactly those 950 m
 
 ## 8. Results: the four questions
 
-From `python scripts/run_queries.py` on the database built on **6 Nov 2026**
-(7,694 of 9,742 movies enriched, covering 98.0% of all ratings; see [Limitations](#13-limitations)).
+From `python scripts/run_queries.py` on the database built on **7 Nov 2026**
+(8,639 of 9,742 movies enriched, covering 98.9% of all ratings; see [Limitations](#13-limitations)).
 Each query in [`queries.sql`](queries.sql) documents its interpretation in a comment.
 
 **Q1. Which movie has the highest average rating?**
@@ -357,8 +357,8 @@ two. All tied movies are returned (none is silently picked by `LIMIT 1`).
 The definition matters: weighting each movie equally (last column) would put Documentary first.
 Film-Noir leads on a relatively small sample (870 ratings).
 
-**Q3. Director with the most movies:** **Woody Allen, 41 movies**, counted over the
-7,694 enriched movies (27 with 3,863; 37 with 4,809 and 5,800; 38 with 6,747). In earlier runs Steven Spielberg led (17 with 969 enriched,
+**Q3. Director with the most movies:** **Woody Allen, 44 movies**, counted over the
+8,639 enriched movies (27 with 3,863; 37 with 4,809 and 5,800; 38 with 6,747; 41 with 7,694). In earlier runs Steven Spielberg led (17 with 969 enriched,
 20 with 1,918, 21 with 1,967 and 23 with 2,916); as less-rated films were enriched, Woody Allen
 overtook him.
 Co-directed films count for each director. This answer covers the enriched subset only and can
@@ -425,23 +425,23 @@ python -m pytest -v         # one line per test
 | **Co-directors in one string** | Split into `movie_directors` rows |
 | **Transient API failures** | Retries with backoff; real retries occurred and succeeded (for example a timeout on 28 Oct, logged as a WARNING and retried after 1 s) |
 | **Daily request limit reached** (observed on 25 Oct: "Request limit reached!" after 1,000 requests that day; seen again on 2 Nov) | Detected from the response text; enrichment stopped at once without retrying, kept every result fetched so far, and Transform and Load still completed (integrity check ok) |
-| **OMDb server-side error** ("Error getting data.", observed for 8 movies so far, e.g. Confessions of a Dangerous Mind, 2002) | Stored as `error`, not `not_found`, so it is retried on later runs (at most 3) instead of being wrongly marked as missing |
+| **OMDb server-side error** ("Error getting data.", observed for 11 movies so far, e.g. Confessions of a Dangerous Mind, 2002) | Stored as `error`, not `not_found`, so it is retried on later runs (at most 3) instead of being wrongly marked as missing |
 | **pandas 3 behaviour changes** (copy-on-write, new string type) | Code written and tested for pandas 3.1; versions pinned |
 | **Tests could have created a real database / called the API** (found during review) | `main()` tests use temporary paths; `conftest.py` blocks all real network access |
 
 ## 13. Limitations
 
-- **Partial enrichment.** As of 6 Nov 2026, after eight days of runs, 7,694 of 9,742
-  movies (79.0%) are enriched. Because the most-rated movies go first, they cover
-  **98.0% of all ratings** (measured). Q3 (directors), box office and plots
+- **Partial enrichment.** As of 7 Nov 2026, after nine days of runs, 8,639 of 9,742
+  movies (88.7%) are enriched. Because the most-rated movies go first, they cover
+  **98.9% of all ratings** (measured). Q3 (directors), box office and plots
   therefore cover the enriched subset only. Running `python etl.py` once a day continues
   automatically from the cache.
-- As of the 6 November 2026 run, eight movies have status `error` ("Error getting data.").
-  Six returned it on all 3 lookup runs, so the pipeline no longer retries them: Confessions of a
+- As of the 7 November 2026 run, eleven movies have status `error` ("Error getting data.").
+  Eight returned it on all 3 lookup runs, so the pipeline no longer retries them: Confessions of a
   Dangerous Mind (2002), Pokemon 3: The Movie (2001), Saturn 3 (1980), Clockstoppers (2002),
-  Lagaan: Once Upon a Time in India (2001) and Pokemon 4 Ever (2002). Berlin Calling (2008) and
-  Horrors of Spider Island (1960) returned it on 4 and 6 Nov (2 of 3 lookup runs each) and will be
-  looked up once more.
+  Lagaan: Once Upon a Time in India (2001), Pokemon 4 Ever (2002), Berlin Calling (2008) and
+  Horrors of Spider Island (1960). Eros (2004), The Two Escobars (2010) and Dragon Ball Z: Broly
+  Second Coming (1994) returned it once on 7 Nov and will be looked up again on later runs.
   Error-status movies are looked up again on later pipeline runs, up to
   3 lookup runs per movie in total. This is separate
   from the retries for temporary network or server failures, where each API request is tried up
