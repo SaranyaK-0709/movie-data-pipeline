@@ -203,7 +203,7 @@ the Extract-stage API results and intentionally has no foreign key to `movies`.
 | Genres in `genres` + `movie_genres` | Up to 10 genres per movie; a pipe-separated string cannot be grouped or joined |
 | Directors in `directors` + `movie_directors` | OMDb lists co-directors in one string; 104 extra links among the first 969 enriched films |
 | Ratings key `(user_id, movie_id)` | 0 duplicate pairs in the source; the key makes duplicates impossible |
-| `release_year` nullable, with its source | 12 titles have no year; MovieLens and OMDb sometimes disagree |
+| `release_year` nullable, with its source | 12 titles have no year in MovieLens (by 9 Nov all 12 had one from OMDb); MovieLens and OMDb sometimes disagree |
 | `STRICT` tables + `CHECK` constraints | Wrong types and impossible values fail loudly instead of being stored |
 | Indexes on `ratings(movie_id)`, `movie_genres(genre_id)`, `movie_directors(director_id)`, `movies(release_year)` | Support the joins and groupings in `queries.sql` |
 | No `users` table | MovieLens has no user attributes beyond the ID |
@@ -283,8 +283,9 @@ budget-limited run loses nothing; the next run skips every movie with a final re
 **Daily quota:** the free key allows 1,000 requests/day, and the dataset has 9,742 movies (at
 least 10 days for full coverage). Movies are therefore enriched **most-rated first**. Profiling
 showed the 950 most-rated movies (about 10% of movies) account for **59.4% of all ratings**.
-After ten days of runs (9,584 movies), the measured coverage is **99.8% of all ratings**
-(`python scripts/inspect_cache.py` prints the current figure).
+After eleven days of runs, every movie has been looked up at least once: 9,726 movies (99.8%)
+are enriched, covering **99.96% of all ratings** (100,792 of 100,836; `python scripts/inspect_cache.py`
+prints the current figure, rounded to 100.0%).
 
 ---
 
@@ -325,8 +326,8 @@ day-2 run on 25 Oct 2026 looked up 950 more movies and wrote exactly those 950 m
 
 ## 8. Results: the four questions
 
-From `python scripts/run_queries.py` on the database built on **8 Nov 2026**
-(9,584 of 9,742 movies enriched, covering 99.8% of all ratings; see [Limitations](#13-limitations)).
+From `python scripts/run_queries.py` on the database built on **9 Nov 2026**
+(9,726 of 9,742 movies enriched, covering 99.96% of all ratings; see [Limitations](#13-limitations)).
 Each query in [`queries.sql`](queries.sql) documents its interpretation in a comment.
 
 **Q1. Which movie has the highest average rating?**
@@ -357,13 +358,13 @@ two. All tied movies are returned (none is silently picked by `LIMIT 1`).
 The definition matters: weighting each movie equally (last column) would put Documentary first.
 Film-Noir leads on a relatively small sample (870 ratings).
 
-**Q3. Director with the most movies:** **Woody Allen, 47 movies**, counted over the
-9,584 enriched movies (27 with 3,863; 37 with 4,809 and 5,800; 38 with 6,747; 41 with 7,694;
-44 with 8,639). In earlier runs Steven Spielberg led (17 with 969 enriched,
+**Q3. Director with the most movies:** **Woody Allen, 48 movies**, counted over the
+9,726 enriched movies (27 with 3,863; 37 with 4,809 and 5,800; 38 with 6,747; 41 with 7,694;
+44 with 8,639; 47 with 9,584). In earlier runs Steven Spielberg led (17 with 969 enriched,
 20 with 1,918, 21 with 1,967 and 23 with 2,916); as less-rated films were enriched, Woody Allen
 overtook him.
-Co-directed films count for each director. This answer covers the enriched subset only and can
-change as enrichment continues.
+Co-directed films count for each director. Only the 16 movies with status `error` have no
+director data, so this answer is now close to final.
 
 **Q4. Average rating of movies released each year:** 106 release years (1902-2018); run
 `python scripts/run_queries.py --all` for the full table. Early years rest on very few ratings
@@ -426,29 +427,31 @@ python -m pytest -v         # one line per test
 | **Co-directors in one string** | Split into `movie_directors` rows |
 | **Transient API failures** | Retries with backoff; real retries occurred and succeeded (for example a timeout on 28 Oct, logged as a WARNING and retried after 1 s) |
 | **Daily request limit reached** (observed on 25 Oct: "Request limit reached!" after 1,000 requests that day; seen again on 2 Nov) | Detected from the response text; enrichment stopped at once without retrying, kept every result fetched so far, and Transform and Load still completed (integrity check ok) |
-| **OMDb server-side error** ("Error getting data.", observed for 13 movies so far, e.g. Confessions of a Dangerous Mind, 2002) | Stored as `error`, not `not_found`, so it is retried on later runs (at most 3) instead of being wrongly marked as missing |
+| **OMDb server-side error** ("Error getting data.", observed for 16 movies so far, e.g. Confessions of a Dangerous Mind, 2002) | Stored as `error`, not `not_found`, so it is retried on later runs (at most 3) instead of being wrongly marked as missing |
 | **pandas 3 behaviour changes** (copy-on-write, new string type) | Code written and tested for pandas 3.1; versions pinned |
 | **Tests could have created a real database / called the API** (found during review) | `main()` tests use temporary paths; `conftest.py` blocks all real network access |
 
 ## 13. Limitations
 
-- **Partial enrichment.** As of 8 Nov 2026, after ten days of runs, 9,584 of 9,742
-  movies (98.4%) are enriched. Because the most-rated movies go first, they cover
-  **99.8% of all ratings** (measured). Q3 (directors), box office and plots
-  therefore cover the enriched subset only. Running `python etl.py` once a day continues
-  automatically from the cache.
-- As of the 8 November 2026 run, thirteen movies have status `error` ("Error getting data.").
-  Eight returned it on all 3 lookup runs, so the pipeline no longer retries them: Confessions of a
+- **Enrichment nearly complete.** As of 9 Nov 2026, after eleven days of runs, every movie has
+  been looked up at least once: 9,726 of 9,742 movies (99.8%) are enriched, covering
+  **99.96% of all ratings** (measured). The 16 movies with status `error` (below) have no
+  director, box office or plot data. Running `python etl.py` again only retries the error
+  movies that have not yet used their 3 lookup runs.
+- As of the 9 November 2026 run, sixteen movies have status `error` ("Error getting data.").
+  Eleven returned it on all 3 lookup runs, so the pipeline no longer retries them: Confessions of a
   Dangerous Mind (2002), Pokemon 3: The Movie (2001), Saturn 3 (1980), Clockstoppers (2002),
-  Lagaan: Once Upon a Time in India (2001), Pokemon 4 Ever (2002), Berlin Calling (2008) and
-  Horrors of Spider Island (1960). Eros (2004), The Two Escobars (2010) and Dragon Ball Z: Broly
-  Second Coming (1994) returned it on 7 and 8 Nov (2 of 3 lookup runs); Cats (1998) and The D Train
-  (2015) returned it once on 8 Nov. These five will be looked up again on later runs.
+  Lagaan: Once Upon a Time in India (2001), Pokemon 4 Ever (2002), Berlin Calling (2008),
+  Horrors of Spider Island (1960), Eros (2004), The Two Escobars (2010) and Dragon Ball Z: Broly
+  Second Coming (1994). Cats (1998) and The D Train (2015) returned it on 8 and 9 Nov (2 of 3
+  lookup runs); Obsession (1965), Dave Chappelle: Equanimity (2017) and Dave Chappelle: The Bird
+  Revelation (2017) returned it once on 9 Nov. These five will be looked up again on later runs.
   Error-status movies are looked up again on later pipeline runs, up to
   3 lookup runs per movie in total. This is separate
   from the retries for temporary network or server failures, where each API request is tried up
   to 3 times (1 original attempt + 2 retries).
-- Not-enriched movies keep `enrichment_status = 'pending'` and NULL OMDb fields.
+- Movies that are not enriched keep NULL OMDb fields (`pending` until first looked up, `error`
+  if OMDb could not return them); as of 9 Nov no movie is `pending`.
 - Averages for small groups (early release years, small genres) are statistically weak.
 - The load inserts and updates; it does not delete movies or ratings that disappear from the source.
 
